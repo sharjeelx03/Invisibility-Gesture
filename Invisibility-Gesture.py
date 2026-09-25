@@ -1,36 +1,112 @@
+"""
+Auto-Background Invisibility Cloak - No need to step out
+- Builds background automatically while you move
+- Human segmentation to find person
+- Pinch thumb+index to toggle invisibility
+- Only turns invisible where background is already learned
 
+pip install opencv-python mediapipe numpy
+python Invisibility-Gesture.py
+"""
 
 import cv2
-import mediapipe as mp
 import numpy as np
 import time
 import math
-from collections import deque
+import os
+import urllib.request
 
-mp_selfie = mp.solutions.selfie_segmentation
-mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
-def get_pinch(hand_landmarks, w, h):
-    thumb = hand_landmarks.landmark[4]
-    index = hand_landmarks.landmark[8]
+# ── Model download ──────────────────────────────────────────────────────────
+MODELS = {
+    "selfie_segmenter.tflite": (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
+    ),
+    "hand_landmarker.task": (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    ),
+}
+
+def ensure_models():
+    """Download model files if they don't already exist next to this script."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for filename, url in MODELS.items():
+        path = os.path.join(script_dir, filename)
+        if not os.path.isfile(path):
+            print(f"Downloading {filename} ...")
+            urllib.request.urlretrieve(url, path)
+            print(f"  saved to {path}")
+
+# ── Hand-drawing helpers (replaces mp.solutions.drawing_utils) ──────────────
+HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),         # thumb
+    (0,5),(5,6),(6,7),(7,8),         # index
+    (0,9),(9,10),(10,11),(11,12),    # middle  (wrist→MCP added for visual)
+    (0,13),(13,14),(14,15),(15,16),  # ring
+    (0,17),(17,18),(18,19),(19,20),  # pinky
+    (5,9),(9,13),(13,17),            # palm cross-connections
+]
+
+def draw_hand_landmarks(image, landmarks, w, h,
+                        dot_color=(0,255,0), line_color=(255,255,255),
+                        dot_radius=3, line_thickness=2):
+    """Draw 21 hand landmarks and connections onto *image* using OpenCV."""
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(image, pts[a], pts[b], line_color, line_thickness)
+    for pt in pts:
+        cv2.circle(image, pt, dot_radius, dot_color, -1)
+
+# ── Pinch detection ─────────────────────────────────────────────────────────
+def get_pinch(landmarks, w, h):
+    thumb = landmarks[4]
+    index = landmarks[8]
     dist_norm = math.hypot(thumb.x - index.x, thumb.y - index.y)
     x1, y1 = int(thumb.x * w), int(thumb.y * h)
     x2, y2 = int(index.x * w), int(index.y * h)
     center = ((x1+x2)//2, (y1+y2)//2)
     return dist_norm, (x1,y1), (x2,y2), center
 
+# ── Main loop ───────────────────────────────────────────────────────────────
 def main():
+    ensure_models()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    
+
     if not cap.isOpened():
         print("Cannot open camera")
         return
 
-    selfie_seg = mp_selfie.SelfieSegmentation(model_selection=1)
-    hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.7)
+    # ── Create Tasks-API models ──────────────────────────────────────────
+    seg_options = vision.ImageSegmenterOptions(
+        base_options=python.BaseOptions(
+            model_asset_path=os.path.join(script_dir, "selfie_segmenter.tflite")
+        ),
+        running_mode=vision.RunningMode.VIDEO,
+        output_confidence_masks=True,
+        output_category_mask=False,
+    )
+    segmenter = vision.ImageSegmenter.create_from_options(seg_options)
+
+    hand_options = vision.HandLandmarkerOptions(
+        base_options=python.BaseOptions(
+            model_asset_path=os.path.join(script_dir, "hand_landmarker.task")
+        ),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.7,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.7,
+    )
+    hand_landmarker = vision.HandLandmarker.create_from_options(hand_options)
 
     invisible_mode = False
     last_toggle = 0
@@ -53,12 +129,28 @@ def main():
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        seg_res = selfie_seg.process(rgb)
-        hand_res = hands.process(rgb)
+        # Monotonically increasing timestamp required by VIDEO mode
+        timestamp_ms = int(time.time() * 1000)
 
-        mask_raw = seg_res.segmentation_mask  # 0=bg, 1=person
-        if mask_raw is None:
-            mask_raw = np.zeros((h,w), dtype=np.float32)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        # ── Segmentation ────────────────────────────────────────────────
+        seg_result = segmenter.segment_for_video(mp_image, timestamp_ms)
+
+        # confidence_masks: index 0 = background, index 1 = person
+        if seg_result.confidence_masks and len(seg_result.confidence_masks) > 0:
+            # selfie_segmenter outputs a single mask (person confidence)
+            # When there's only one mask it's person confidence directly
+            if len(seg_result.confidence_masks) == 1:
+                mask_raw = seg_result.confidence_masks[0].numpy_view().copy()
+            else:
+                # If two masks, index 1 is person
+                mask_raw = seg_result.confidence_masks[1].numpy_view().copy()
+        else:
+            mask_raw = np.zeros((h, w), dtype=np.float32)
+
+        # ── Hand detection ───────────────────────────────────────────────
+        hand_result = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
 
         # Soft masks
         person_mask_prob = cv2.GaussianBlur(mask_raw, (21,21), 0)  # 0..1
@@ -84,12 +176,10 @@ def main():
 
         # --- Gesture ---
         is_pinch = False
-        if hand_res.multi_hand_landmarks:
-            for hl in hand_res.multi_hand_landmarks:
-                mp_draw.draw_landmarks(frame, hl, mp_hands.HAND_CONNECTIONS,
-                    mp_draw.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=2),
-                    mp_draw.DrawingSpec(color=(255,255,255), thickness=2))
-                
+        if hand_result.hand_landmarks:
+            for hl in hand_result.hand_landmarks:
+                draw_hand_landmarks(frame, hl, w, h)
+
                 dist_norm, p1, p2, center = get_pinch(hl, w, h)
                 if dist_norm < 0.05:
                     is_pinch = True
@@ -175,8 +265,8 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
-    selfie_seg.close()
-    hands.close()
+    segmenter.close()
+    hand_landmarker.close()
 
 if __name__ == "__main__":
     main()

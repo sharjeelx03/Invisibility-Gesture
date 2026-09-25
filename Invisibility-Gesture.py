@@ -1,13 +1,4 @@
-"""
-Auto-Background Invisibility Cloak - No need to step out
-- Builds background automatically while you move
-- Human segmentation to find person
-- Pinch thumb+index to toggle invisibility
-- Only turns invisible where background is already learned
 
-pip install opencv-python mediapipe numpy
-python invisibility_auto_bg.py
-"""
 
 import cv2
 import mediapipe as mp
